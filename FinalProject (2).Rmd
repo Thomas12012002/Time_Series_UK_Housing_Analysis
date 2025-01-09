@@ -1,0 +1,887 @@
+```{r}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(forecast)
+library(tseries)
+library(scales)  
+library(rugarch)
+library(fastDummies)  # For creating dummy variables
+library(sf)
+library(spdep)
+library(tidyr)
+library(dplyr)
+library(spdep)       # For spatial correlation analysis 
+library(ggplot2)     # For visualizing spatial patterns
+library(sf)          # For handling spatial data
+library(sp)          # Spatial data processing
+#install.packages("tmap")
+library(tmap)        # For spatial plotting
+```
+
+# The dataset contains over 1 millions rows of housing prices from UK housing, obtained from Kaggle. I filter out missing , NA values and convert the sale amount to K notation for better visualzation in the forecasting charts. In adiditon, I convert the textual property types values into the numerical vlues known as dummy variables. 
+
+```{r}
+file_path <- "real_estate.csv"  
+real_estate_data <- read.csv(file_path, stringsAsFactors = FALSE)
+```
+
+# I replace the space of the variable with dot and remove nana and na and missing values
+
+```{r}
+# Ensure column names are cleaned for consistency
+colnames(real_estate_data) <- gsub("\\s+", ".", colnames(real_estate_data))  # Replace spaces with dots
+
+# Filter the data for relevant columns and remove missing values
+real_estate_data <- real_estate_data %>%
+  filter(!is.na(Date.Recorded) & !is.na(Sale.Amount) & Sale.Amount > 0) %>%
+  dplyr::select(Date.Recorded, Sale.Amount, Sales.Ratio, Property.Type)
+```
+
+# For the textual data, I use dummy variable and convert property type to numerical values
+
+```{r}
+# Convert Sale.Amount to thousands (k)
+real_estate_data$Sale.Amount <- real_estate_data$Sale.Amount / 1000
+
+# Convert Property.Type to Numeric and Create Dummy Variables
+real_estate_data$Property.Type.Num <- as.numeric(as.factor(real_estate_data$Property.Type))
+dummy_vars <- dummy_cols(real_estate_data$Property.Type, remove_first_dummy = TRUE)
+dummy_vars <- dummy_vars[, -1]  # Exclude the original Property.Type column
+
+# Aggregate data by month without modifying Date.Recorded
+real_estate_data$YearMonth <- substr(real_estate_data$Date.Recorded, 1, 7)  # Extract year and month
+monthly_data <- real_estate_data %>%
+  group_by(YearMonth) %>%
+  summarise(Sale.Amount = sum(Sale.Amount, na.rm = TRUE),
+            Avg.Property.Type = mean(Property.Type.Num, na.rm = TRUE)) %>%
+  ungroup()
+```
+
+# Since there is overlapping in the chart when plotting the amount and the years, I convert 1000 to 1k for better visualization.
+
+```{r}
+# Create time series object for Sale Amount
+housing_ts <- ts(monthly_data$Sale.Amount, 
+                 start = c(as.numeric(substr(min(monthly_data$YearMonth), 1, 4)), 
+                           as.numeric(substr(min(monthly_data$YearMonth), 6, 7))), 
+                 frequency = 12)
+
+# Plot the time series with a red smoothing line and formatted y-axis
+ggplot(data = monthly_data, aes(x = as.Date(paste0(YearMonth, "-01")), y = Sale.Amount)) +
+  geom_line(color = "blue") +
+  geom_smooth(method = "loess", color = "red") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Housing Sale Amount Over Time", x = "Date", y = "Sale Amount (in k)") +
+  theme_minimal()
+```
+
+#Check ACF and PACF before differencing and apply the lag of these plots for non seasonal terms of SARIMA model later on
+
+```{r}
+# Check ACF and PACF before differencing
+acf(housing_ts, main = "ACF Before Differencing")
+pacf(housing_ts, main = "PACF Before Differencing")
+
+# Test stationarity 
+adf_test <- adf.test(housing_ts)
+cat("ADF Test p-value:", adf_test$p.value, "\n")
+```
+
+# The p value is above 0.05 so I have to apply differencing
+
+```{r}
+# Differencing
+housing_ts_diff <- diff(housing_ts)
+adf_test_diff <- adf.test(housing_ts_diff)
+print(adf_test_diff)
+```
+
+# Now the p value is below 0.05
+
+```{r}
+# Plot the differenced series with smoothing
+ggplot(data = data.frame(Date = time(housing_ts_diff), Value = as.numeric(housing_ts_diff)), aes(x = Date, y = Value)) +
+    geom_line(color = "blue") +
+    geom_smooth(method = "loess", color = "red") +
+    scale_y_continuous(labels = scales::comma) +
+    labs(title = "Differenced Housing Sale Amount Over Time", x = "Year", y = "Differenced Sale Amount (in k)") +
+    theme_minimal()
+```
+
+#Plotting the chart to see the trend and to check the original time series data
+
+```{r}
+decomp_result <- decompose(housing_ts, type = "additive")
+print(decomp_result)
+plot(decomp_result)
+```
+# This clearly shows that differencing is needed since there is seasonality
+
+```{r}
+# Re-check ACF and PACF
+acf(housing_ts_diff, main = "ACF After Differencing")
+pacf(housing_ts_diff, main = "PACF After Differencing")
+```
+
+# The lag shown in acf and pacf plots will be used for seasonal terms later in SARIMA model
+
+```{r}
+# Auto ARIMA model
+auto_arima_model <- auto.arima(housing_ts_diff)
+summary(auto_arima_model)
+
+# Residual checks for Auto ARIMA
+checkresiduals(auto_arima_model)
+
+# Manual SARIMA testing with different parameters
+sarima_models <- list()
+sarima_aic_values <- c()
+
+# Loop through SARIMA parameters
+sarima_models <- list()
+sarima_aic_values <- c()
+
+# Loop through SARIMA parameters 
+#for (p in 0:2) {
+#  for (d in 0:1) {
+#    for (q in 0:2) {
+#      for (P in 0:5) {
+#        for (D in 0:1) {
+#          for (Q in 0:4) {
+#            model_name <- paste0("SARIMA(", p, ",", d, ",", q, ")(,", P, ",", D, ",", Q, ")[12]")
+#            cat("Fitting", model_name, "\n")
+            
+#            try({
+#              sarima_model <- Arima(housing_ts_diff, order = c(p, d, q),
+#                                    seasonal = list(order = c(P, D, Q), period = 12),
+#                                    method = "ML")
+#              sarima_models[[model_name]] <- sarima_model
+#              sarima_aic_values <- c(sarima_aic_values, AIC(sarima_model))
+#            })
+#          }
+#        }
+#      }
+#    }
+#  }
+#}
+
+# Choose the best SARIMA model
+#best_sarima_index <- which.min(sarima_aic_values)
+#best_sarima_model <- sarima_models[[best_sarima_index]]
+
+# Choose the best SARIMA model which is ARIMA(1,1,2)(0,1,1) [12]
+best_sarima_model <- Arima(housing_ts_diff, 
+                           order = c(1, 1, 2), 
+                           seasonal = list(order = c(0, 1, 1), period = 12), 
+                           method = "ML")
+
+#cat("Best SARIMA Model:", names(sarima_models)[best_sarima_index], "\n")
+summary(best_sarima_model)
+
+# Residual checks for SARIMA
+checkresiduals(best_sarima_model)
+```
+
+# The residuals of SARIMA seems to be a better fit for the data as compared to that of the ARIMA model. However, Sarima does not seems to capture the pattern of the 2 major spikes of the data. GARCH will have solve this issue in later analysis of volatility.
+
+```{r}
+# Extract coefficients
+auto_arima_coefficients <- coef(auto_arima_model)
+```
+
+
+# I tried to plot the first SARIMA non seasonal and seasonal terms and check the AIC, but I still want to make sure I choose the best SARIMA model so I try a loop as shown above with different values from 0 to 4 or 5 for p,d,q,P,D,Q to test the best SARIMA model based on AIC. Then from that best SARIMA model, I will proceed for forecasting 5 years and cross correlation and spatial correlation to choose the best town name and then make forecasting 5 years price for that town. 
+
+```{r}
+# Add GARCH modeling for volatility
+garch_data <- as.numeric(housing_ts_diff)
+garch_data <- garch_data[!is.na(garch_data) & !is.infinite(garch_data)] # Ensure the differenced time series has no NA or infinite values
+garch_data <- scale(garch_data)  # Scale the data
+
+# Define the GARCH model specification
+garch_spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(1, 0), include.mean = TRUE),
+  distribution.model = "norm"
+)
+
+# Fit the GARCH model
+# Try with errors so I make try catch for cases and the error returns Error in garch fitting if possible
+garch_fit <- tryCatch({
+  fit <- ugarchfit(spec = garch_spec, data = garch_data, solver = "hybrid")
+  if (!is.null(fit@fit$convergence) && fit@fit$convergence == 0) {
+    fit  # Successful fit
+  } else {
+    stop("GARCH model did not converge.")
+  }
+}, error = function(e) {
+  message("Error in GARCH fitting: ", e$message)
+  NULL  # Return NULL if fitting fails
+})
+
+# Evaluate the GARCH model fit
+cat("GARCH model successfully fitted.\n")
+print(garch_fit)
+
+
+
+
+```
+# The first ADF test has p value above 0.05 so I apply differencing which makes this p value below 0.05, which is now 0.01. I plot the acf and pacf after differing and seems like I choose AR(2) and MA(1) for non seasonal part and AR(1) and MA(0) for seasonal part. I try different SARIMA model for p,d,q,P,D,Q paramters ranging from 0 to 5 to choose the best possible model. The SARIMA (1,1,2)(0,1,1)[12] has the lowest AIC score. Then I check residuals of this SARIMA model, which shows 2 major spikes while the majority is good enough around 0. 
+
+
+```{r}
+# Compare AIC values 
+aic_auto_arima <- AIC(auto_arima_model)
+aic_sarima <- AIC(best_sarima_model)
+
+cat("AIC for Auto ARIMA:", aic_auto_arima, "\n")
+cat("AIC for SARIMA:", aic_sarima, "\n")
+
+# Calculate RMSE
+# For Auto ARIMA
+rmse_auto_arima <- sqrt(mean(residuals(auto_arima_model)^2))
+# For SARIMA
+rmse_sarima <- sqrt(mean(residuals(best_sarima_model)^2))
+
+
+cat("RMSE for Auto ARIMA:", rmse_auto_arima, "\n")
+cat("RMSE for SARIMA:", rmse_sarima, "\n")
+
+# Ljung-Box Test
+# For Auto ARIMA
+ljung_box_auto_arima <- Box.test(residuals(auto_arima_model), lag = 10, type = "Ljung-Box")
+cat("Ljung-Box p-value for Auto ARIMA:", ljung_box_auto_arima$p.value, "\n")
+# For SARIMA
+ljung_box_sarima <- Box.test(residuals(best_sarima_model), lag = 10, type = "Ljung-Box")
+cat("Ljung-Box p-value for SARIMA:", ljung_box_sarima$p.value, "\n")
+
+# For GARCH (volatility residuals)
+ljung_box_garch <-Box.test(na.omit(residuals(garch_fit, standardize = TRUE)), lag = 10, type = "Ljung-Box")
+cat("Ljung-Box p-value for GARCH:", ljung_box_garch$p.value, "\n")
+
+# Compare ARIMA and SARIMA Models
+cat("\n--- ARIMA/SARIMA Model Performance Comparison ---\n")
+comparison_table_arima <- data.frame(
+  Model = c("Auto ARIMA", "SARIMA"),
+  AIC = c(aic_auto_arima, aic_sarima),
+  RMSE = c(rmse_auto_arima, rmse_sarima),
+  Ljung_Box_p_value = c(
+    ljung_box_auto_arima$p.value,
+    ljung_box_sarima$p.value
+  )
+)
+
+print(comparison_table_arima)
+
+
+
+
+
+```
+
+# I also test Ljung box test which clearly shows SARIMA a good model with p value above 0.05
+
+```{r}
+# Fit GARCH model to SARIMA residuals
+# Ensure residuals are free from NA or infinite values
+sarima_residuals <- residuals(best_sarima_model)
+garch_data <- na.omit(scale(sarima_residuals)) 
+
+garch_spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(0, 0), include.mean = FALSE),
+  distribution.model = "norm"  # Use normal distribution
+)
+
+garch_fit <- ugarchfit(spec = garch_spec, data = garch_data, solver = "hybrid")
+print(garch_fit)
+
+# Analyze and plot conditional volatility
+# Extract conditional standard deviations (volatility)
+garch_volatility <- sigma(garch_fit)
+# Create a time series for volatility
+volatility_ts <- ts(garch_volatility, start = start(housing_ts_diff), frequency = frequency(housing_ts_diff))
+# Plot the conditional volatility
+plot(volatility_ts, col = "red", main = "Conditional Volatility from GARCH Model", ylab = "Volatility", xlab = "Time")
+# Overlay spikes with SARIMA residuals for comparison
+plot(sarima_residuals, main = "SARIMA Residuals with Volatility Overlay", col = "blue", ylab = "Residuals", xlab = "Time")
+lines(volatility_ts, col = "red", lwd = 2)
+
+
+```
+
+# The conditional volatility captures the structure of the data with 2 major spikes around 2015 and 2020, in which the SARIMA model cannot capture these events.
+
+
+
+```{r}
+# Cross-Correlation Analysis
+
+# Ensure both variables are time series of the same length
+sale_amount_ts <- ts(monthly_data$Sale.Amount, start = c(as.numeric(substr(min(monthly_data$YearMonth), 1, 4)), 
+                                                         as.numeric(substr(min(monthly_data$YearMonth), 6, 7))), 
+                     frequency = 12)
+property_type_ts <- ts(monthly_data$Avg.Property.Type, start = c(as.numeric(substr(min(monthly_data$YearMonth), 1, 4)), 
+                                                                 as.numeric(substr(min(monthly_data$YearMonth), 6, 7))), 
+                       frequency = 12)
+
+# Make use cross-correlation
+cat("\n Cross-Correlation Analysis...\n")
+ccf_results <- ccf(sale_amount_ts, property_type_ts, lag.max = 24, main = "Cross-Correlation: Sale Amount vs Avg. Property Type")
+
+# Display the cross-correlation values
+cat("\nCross-Correlation Values:\n")
+print(ccf_results)
+cat("\nPositive correlation at lag indicates Property.Type leads Sale.Amount, and negative lag indicates the reverse.\n")
+
+```
+
+# Regarding the cross-correlation of sale amount and average of property type, which I just dummy variables technique to convert the textual value type into numerical values to use in the cross correlation. According to the chart, the property type has correlation with sale amount after lag 1, betwwen lag 1 and 2 specifically.  Which also means that the sale amount increases after lag 1 and before lag 2 for the property type.
+
+```{r}
+# Forecasting based on the best SARIMA model
+sarima_forecast <- forecast(best_sarima_model, h = 60)
+plot(sarima_forecast, main = "Best SARIMA Forecast", ylab = "Sale Amount (in k)", xlab = "Year", col = "blue")
+
+
+```
+
+# Based on the Best SARIMA model, I plot the price predicting upto 2025.
+
+```{r}
+# Forecasting based on the best SARIMA model
+# Using the original data (not differenced)
+
+# Fit the best SARIMA model on the original dataset
+best_sarima_model_original <- Arima(
+  housing_ts, 
+  order = c(1, 1, 2), 
+  seasonal = list(order = c(0, 1, 1), period = 12)
+)
+
+# Forecast for the next 5 years (60 months)
+forecast_horizon <- 60  # 5 years of monthly data
+sarima_forecast_original <- forecast(best_sarima_model_original, h = forecast_horizon)
+
+# Plot the forecast
+ggplot() +
+  geom_line(aes(
+    x = time(housing_ts), 
+    y = as.numeric(housing_ts)
+  ), color = "blue") +
+  geom_ribbon(
+    aes(
+      x = time(sarima_forecast_original$mean), 
+      ymin = sarima_forecast_original$lower[, 2], 
+      ymax = sarima_forecast_original$upper[, 2]
+    ), 
+    fill = "gray80", alpha = 0.5
+  ) +
+  geom_line(
+    aes(
+      x = time(sarima_forecast_original$mean), 
+      y = as.numeric(sarima_forecast_original$mean)
+    ), 
+    color = "red"
+  ) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "SARIMA Forecast Based on Original Data",
+    x = "Year", 
+    y = "Sale Amount (in k)"
+  ) +
+  theme_minimal()
+
+```
+
+# Then I also plot the price predicting based on the original data to better understand the actual price forecasting with actual numbers.
+
+```{r}
+# Extract coefficients of the best SARIMA model
+sarima_coefficients <- coef(best_sarima_model)
+print(sarima_coefficients)
+
+```
+# SARIMA(1,1,2)(0,1,1)[12]
+# The SARIMA equation:
+
+# The Best SARIMA model is SARIMA(1,1,2)(0,1,1)[12]:
+# (1 + 0.4066 * B)(1 - B)(1 - B^12) * H_t = (1 + 0.5899 * B + 0.4101 * B^2)(1 + 1.0000 * B^12) * ε_t
+
+
+```{r}
+print(auto_arima_coefficients)
+```
+# Auto ARIMA Model:
+# ΔH_t = -0.4066 * H_{t-1} - 0.5899 * ε_{t-1} - 0.4101 * ε_{t-2} + ε_t
+
+####################################################################################
+################ Combine SARIMA Best Model and Garch for forecasting ################
+
+```{r}
+# Extract SARIMA Residuals and Fit GARCH Model
+sarima_residuals <- residuals(best_sarima_model)
+garch_data <- na.omit(scale(sarima_residuals))
+
+garch_spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(0, 0), include.mean = FALSE),
+  distribution.model = "norm"
+)
+
+garch_fit <- ugarchfit(spec = garch_spec, data = garch_data, solver = "hybrid")
+
+# Forecast Using SARIMA + GARCH
+forecast_horizon <- 60  # Forecast 5 years (60 months)
+
+# Forecast SARIMA Mean
+sarima_forecast <- forecast(best_sarima_model, h = forecast_horizon)
+sarima_mean_forecast <- sarima_forecast$mean
+
+# Forecast GARCH Volatility
+garch_forecast <- ugarchforecast(garch_fit, n.ahead = forecast_horizon)
+garch_sigma_forecast <- sigma(garch_forecast)  # Conditional standard deviation (volatility)
+
+# Combine SARIMA Mean and GARCH Volatility
+combined_forecast <- data.frame(
+  Time = time(sarima_mean_forecast),
+  Forecast = as.numeric(sarima_mean_forecast),
+  Lower = as.numeric(sarima_mean_forecast - 1.96 * garch_sigma_forecast),
+  Upper = as.numeric(sarima_mean_forecast + 1.96 * garch_sigma_forecast)
+)
+
+# Plot Combined SARIMA + GARCH Forecast
+ggplot(combined_forecast, aes(x = Time)) +
+  geom_line(aes(y = Forecast), color = "blue", size = 1, linetype = "solid") +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), fill = "gray80", alpha = 0.5) +
+  labs(title = "Combined SARIMA + GARCH Forecast", 
+       x = "Year", 
+       y = "Sale Amount (in k)") +
+  theme_minimal() +
+  geom_point(data = data.frame(Time = time(housing_ts), Value = as.numeric(housing_ts)), 
+             aes(x = Time, y = Value), color = "black", size = 1, alpha = 0.7)
+
+```
+
+####################################################  SARIMA + GARCH Model visualization  ########################################
+
+```{r}
+# Improved Combined SARIMA + GARCH Forecast Plot
+ggplot(combined_forecast, aes(x = Time)) +
+  # Historical data points
+  geom_point(data = data.frame(Time = time(housing_ts), Value = as.numeric(housing_ts)), 
+             aes(x = Time, y = Value), 
+             color = "black", size = 1.5, alpha = 0.7) +
+  # SARIMA mean forecast line
+  geom_line(aes(y = Forecast), color = "blue", size = 1.2, linetype = "solid") +
+  # Confidence intervals from SARIMA + GARCH
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), fill = "skyblue", alpha = 0.3) +
+  # Axis formatting
+  scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  # Adding titles and labels
+  labs(
+    title = "Combined SARIMA + GARCH Forecast of Housing Sale Amount",
+    subtitle = "5-Year Forecast with Dynamic Volatility Adjustment",
+    x = "Year",
+    y = "Sale Amount (in k)"
+  ) +
+  # Theme enhancements
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title.x = element_text(face = "bold"),
+    axis.title.y = element_text(face = "bold"),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank()
+  ) +
+  # Highlight the forecast start point
+  geom_vline(xintercept = tail(time(housing_ts), 1), color = "red", linetype = "dashed", size = 1) +
+  annotate("text", x = tail(time(housing_ts), 1) + 1, y = max(housing_ts), label = "Forecast Start", color = "red", size = 4, hjust = 0)
+
+```
+
+
+############################################################
+# Spatial correlation and choose the highest sale town to predict 5 years of price
+
+```{r}
+file <- "real_estate.csv"
+
+# Load the full dataset
+real_estate_data_full <- read.csv(file, stringsAsFactors = FALSE)
+
+# Clean column names for consistency
+colnames(real_estate_data_full) <- gsub("\\s+", ".", colnames(real_estate_data_full))
+
+# Check the column names
+print(colnames(real_estate_data_full))
+
+# Create a subset with relevant columns (include Town)
+real_estate_data <- real_estate_data_full %>%
+  filter(!is.na(Date.Recorded) & !is.na(Sale.Amount) & Sale.Amount > 0) %>%
+  select(Date.Recorded, Sale.Amount, Sales.Ratio, Property.Type, Residential.Type, Town, Longitude, Latitude)
+
+# Convert Sale.Amount to k
+real_estate_data$Sale.Amount <- real_estate_data$Sale.Amount / 1000
+
+# Ensure Date.Recorded is in correct date format
+real_estate_data$Date.Recorded <- as.Date(real_estate_data$Date.Recorded)
+
+# Create YearMonth as YYYY-MM
+real_estate_data$YearMonth <- format(real_estate_data$Date.Recorded, "%Y-%m")
+
+# Filter out any empty YearMonth
+real_estate_data <- real_estate_data %>%
+  filter(!is.na(YearMonth), YearMonth != "")
+
+# Aggregate by town and month
+town_month_data <- real_estate_data %>%
+  group_by(Town, YearMonth) %>%
+  summarise(Avg_Sale_Amount = mean(Sale.Amount, na.rm = TRUE), .groups = "drop")
+
+```
+
+# There are so many missing, NAn, or Na data values in the longitude and latitude so i have to filter out these missing values.
+
+```{r}
+# Get unique town coordinates (average lat/lon per town)
+town_coords <- real_estate_data %>%
+  group_by(Town) %>%
+  summarise(Town_Lat = mean(Latitude, na.rm = TRUE),
+            Town_Lon = mean(Longitude, na.rm = TRUE),
+            .groups = "drop")
+
+# Join coordinates to town-month data
+town_month_data <- left_join(town_month_data, town_coords, by = "Town")
+```
+
+
+```{r}
+# Remove any rows with missing coordinates
+town_month_data <- town_month_data %>%
+  filter(!is.na(Town_Lon), !is.na(Town_Lat))
+
+# Create a Wide format for Differencing
+unique_months <- sort(unique(town_month_data$YearMonth))
+
+town_wide <- town_month_data %>%
+  select(Town, YearMonth, Avg_Sale_Amount) %>%
+  pivot_wider(id_cols = Town, names_from = YearMonth, values_from = Avg_Sale_Amount)
+
+# Ensure columns are sorted by date
+town_wide <- town_wide[, c("Town", unique_months)]
+```
+
+
+```{r}
+town_wide_diff <- town_wide
+diff_matrix <- t(apply(town_wide_diff[, -1], 1, function(x) diff(x, lag = 1)))
+diff_months <- unique_months[-1]
+town_wide_diff <- data.frame(Town = town_wide$Town, diff_matrix)
+colnames(town_wide_diff) <- c("Town", diff_months)
+
+# Compute average differenced price per town
+diff_averages <- town_wide_diff %>%
+  rowwise() %>%
+  mutate(Avg_Diff_Price = mean(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+  ungroup() %>%
+  select(Town, Avg_Diff_Price)
+
+diff_averages <- diff_averages %>% filter(!is.na(Avg_Diff_Price))
+```
+
+# I want to understand the correlation of town and the price to choose the best or highest price town and make the prediction or forecasting price of 5 years based on that.
+
+```{r}
+# Spatial correlation 
+town_sf <- left_join(town_coords, diff_averages, by = "Town") %>%
+  filter(!is.na(Avg_Diff_Price), !is.na(Town_Lon), !is.na(Town_Lat))
+
+town_sf <- st_as_sf(town_sf, coords = c("Town_Lon", "Town_Lat"), crs = 4326)
+
+# k-nearest neighbors
+coords <- st_coordinates(town_sf)
+knn <- knearneigh(coords, k = 5)
+nb_knn <- knn2nb(knn)
+lw_knn <- nb2listw(nb_knn, style = "W")
+
+moran_result <- moran.test(town_sf$Avg_Diff_Price, lw_knn)
+print(moran_result)
+```
+# Since the p value is much greater than 0.05, the model fails to reject the null hypothesis of no spatial autocorrelation. Thus there is no significant spatial correlation.
+
+```{r}
+# Select the Highest-Priced town 
+diff_averages <- diff_averages %>% arrange(desc(Avg_Diff_Price))
+top_town <- diff_averages$Town[1]
+cat("The highest priced town is:", top_town, "\n")
+
+# Forecasting for the selested town with the best SARIMA
+selected_town_data <- town_month_data %>%
+  filter(Town == top_town) %>%
+  arrange(YearMonth)
+
+selected_town_data$Date <- as.Date(paste0(selected_town_data$YearMonth, "-01"))
+
+start_year <- as.numeric(format(min(selected_town_data$Date), "%Y"))
+start_month <- as.numeric(format(min(selected_town_data$Date), "%m"))
+town_ts <- ts(selected_town_data$Avg_Sale_Amount, start = c(start_year, start_month), frequency = 12)
+
+# ARIMA(1,1,2)(0,1,1)[12]
+best_sarima_model <- Arima(
+  town_ts,
+  order = c(1, 1, 2),
+  seasonal = list(order = c(0, 1, 1), period = 12),
+  method = "ML"
+)
+summary(best_sarima_model)
+```
+
+# I forecast the next 5 years or 60 months using different color like red and gray and blue such that red is predicting price for 5 years while gray is confident interval and blue is from the original data values.
+
+```{r}
+# Forecast for the next 60 months
+horizon <- 60
+town_forecast <- forecast(best_sarima_model, h = horizon)
+
+# Create a data frame for the forecast
+future_dates <- seq(
+  from = tail(selected_town_data$Date, 1) %m+% months(1),
+  by = "month",
+  length.out = horizon
+)
+
+forecast_df <- data.frame(
+  Date = future_dates,
+  Forecast = as.numeric(town_forecast$mean),
+  Lower80 = as.numeric(town_forecast$lower[,1]),
+  Upper80 = as.numeric(town_forecast$upper[,1]),
+  Lower95 = as.numeric(town_forecast$lower[,2]),
+  Upper95 = as.numeric(town_forecast$upper[,2])
+)
+```
+
+
+```{r}
+# Plot the historical data and the forecast on the original scale
+ggplot() +
+  # Historical data
+  geom_line(data = selected_town_data, aes(x = Date, y = Avg_Sale_Amount), color = "blue") +
+  
+  # 95% interval
+  geom_ribbon(data = forecast_df, aes(x = Date, ymin = Lower95, ymax = Upper95), fill = "gray80", alpha = 0.5) +
+  # 80% interval
+  geom_ribbon(data = forecast_df, aes(x = Date, ymin = Lower80, ymax = Upper80), fill = "gray60", alpha = 0.5) +
+  
+  # Forecast line
+  geom_line(data = forecast_df, aes(x = Date, y = Forecast), color = "red") +
+  
+  labs(title = paste("Forecast for", top_town, "Using SARIMA(1,1,2)(0,1,1)[12]"),
+       x = "Date", y = "Sale Amount (in k)") +
+  theme_minimal()
+
+```
+
+# The result shows Deep River town price forecasting for 5 years of upto 500k pounds
+
+####################################################################################
+
+```{r}
+# Aggregate data by Residential Type and Month
+residential_data <- real_estate_data %>%
+  group_by(Residential.Type, YearMonth) %>%
+  summarise(
+    Avg_Sale_Amount = mean(Sale.Amount, na.rm = TRUE),
+    Transaction_Count = n(),
+    .groups = "drop"
+  )
+
+# Inspect the aggregated data
+print(head(residential_data))
+
+```
+
+```{r}
+# Aggregate by Residential Type and Location (Latitude and Longitude)
+residential_coords <- real_estate_data %>%
+  group_by(Residential.Type) %>%
+  summarise(
+    Avg_Sale_Amount = mean(Sale.Amount, na.rm = TRUE),
+    Avg_Latitude = mean(Latitude, na.rm = TRUE),
+    Avg_Longitude = mean(Longitude, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Convert to spatial data
+residential_sf <- st_as_sf(residential_coords, coords = c("Avg_Longitude", "Avg_Latitude"), crs = 4326)
+
+# k-nearest neighbors for spatial correlation
+coords <- st_coordinates(residential_sf)
+knn <- knearneigh(coords, k = 5)
+nb_knn <- knn2nb(knn)
+lw_knn <- nb2listw(nb_knn, style = "W")
+
+# Moran's I for Avg_Sale_Amount by Residential Type
+moran_result_residential <- moran.test(residential_sf$Avg_Sale_Amount, lw_knn)
+print(moran_result_residential)
+
+```
+# Since p value also is much greater than 0.05, the model falis to reject the null hypothesis. Thus, filtering out missing or na data value might get rid of valuable correlations. Hence, I have to recheck the data processing step.
+
+```{r}
+# Filter data to remove missing or NA values for Residential Type and Sale Amount
+filtered_data <- real_estate_data %>%
+  filter(!is.na(Residential.Type), 
+         !is.na(Sale.Amount), 
+         Sale.Amount > 0)
+
+# Group by Residential Type and calculate aggregated metrics
+residential_agg <- filtered_data %>%
+  group_by(Residential.Type) %>%
+  summarise(
+    Avg_Sale_Amount = mean(Sale.Amount, na.rm = TRUE),
+    Transaction_Count = n(),
+    .groups = "drop"
+  )
+
+
+```
+
+```{r}
+print(dim(residential_agg))  # Check dimensions
+print(head(residential_agg))  # Check first few rows
+
+
+```
+# Since the Condo residential type has the biggest sale amount, choose this residence for forecasting 5 years price.
+
+```{r}
+# Filter data for the most expensive residential type: Condo
+condo_data <- filtered_data %>%
+  filter(Residential.Type == "Condo") %>%
+  group_by(Date.Recorded) %>%
+  summarise(Sale.Amount = sum(Sale.Amount, na.rm = TRUE), .groups = "drop") %>%
+  arrange(Date.Recorded)
+
+# Convert Date.Recorded to Date format
+condo_data$Date <- as.Date(condo_data$Date.Recorded)
+
+# Create a time series object
+start_year <- as.numeric(format(min(condo_data$Date), "%Y"))
+start_month <- as.numeric(format(min(condo_data$Date), "%m"))
+condo_ts <- ts(condo_data$Sale.Amount, start = c(start_year, start_month), frequency = 12)
+
+# Fit SARIMA Model
+best_sarima_model <- Arima(
+  condo_ts,
+  order = c(1, 1, 2),  # Based on the previous best SARIMA model
+  seasonal = list(order = c(0, 1, 1), period = 12),
+  method = "ML"
+)
+
+# Print SARIMA model summary
+summary(best_sarima_model)
+
+# Forecast the next 5 years (60 months)
+forecast_horizon <- 60
+condo_forecast <- forecast(best_sarima_model, h = forecast_horizon)
+
+# Create a data frame for the forecast
+future_dates <- seq(
+  from = tail(condo_data$Date, 1) %m+% months(1),
+  by = "month",
+  length.out = forecast_horizon
+)
+
+forecast_df <- data.frame(
+  Date = future_dates,
+  Forecast = as.numeric(condo_forecast$mean),
+  Lower80 = as.numeric(condo_forecast$lower[, 1]),
+  Upper80 = as.numeric(condo_forecast$upper[, 1]),
+  Lower95 = as.numeric(condo_forecast$lower[, 2]),
+  Upper95 = as.numeric(condo_forecast$upper[, 2])
+)
+
+# Plot historical data and forecast
+ggplot() +
+  # Historical data
+  geom_line(data = condo_data, aes(x = Date, y = Sale.Amount), color = "blue") +
+  
+  # 95% confidence interval
+  geom_ribbon(data = forecast_df, aes(x = Date, ymin = Lower95, ymax = Upper95), fill = "gray80", alpha = 0.5) +
+  # 80% confidence interval
+  geom_ribbon(data = forecast_df, aes(x = Date, ymin = Lower80, ymax = Upper80), fill = "gray60", alpha = 0.5) +
+  
+  # Forecast line
+  geom_line(data = forecast_df, aes(x = Date, y = Forecast), color = "red") +
+  
+  labs(
+    title = "5-Year Forecast for Condo Sale Amount",
+    x = "Date",
+    y = "Sale Amount"
+  ) +
+  theme_minimal()
+```
+
+# The forecast of Condo sale amount for 5 years.
+
+```{r}
+real_estate_data_full <- read.csv(file, stringsAsFactors = FALSE)
+
+# Clean column names for consistency
+colnames(real_estate_data_full) <- gsub("\\s+", ".", colnames(real_estate_data_full))
+
+# Filter and prepare the data
+real_estate_data <- real_estate_data_full %>%
+  filter(!is.na(Date.Recorded) & !is.na(Sale.Amount) & Sale.Amount > 0 & 
+           !is.na(Longitude) & !is.na(Latitude)) %>%
+  select(Town, Sale.Amount, Longitude, Latitude)
+
+# Aggregate the average sale amount by town
+town_data <- real_estate_data %>%
+  group_by(Town) %>%
+  summarise(
+    Avg_Sale_Amount = mean(Sale.Amount, na.rm = TRUE),
+    Longitude = mean(Longitude, na.rm = TRUE),
+    Latitude = mean(Latitude, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Convert to Spatial DataFrame (spatial object)
+coordinates(town_data) <- ~ Longitude + Latitude
+proj4string(town_data) <- CRS("+proj=longlat +datum=WGS84")  # Set coordinate reference system
+
+# Create a spatial weights matrix for neighboring towns
+town_nb <- knn2nb(knearneigh(coordinates(town_data), k = 4))  # 4 nearest neighbors
+town_weights <- nb2listw(town_nb, style = "W", zero.policy = TRUE)
+
+# Calculate Moran's I for spatial correlation
+moran_result <- moran.test(town_data$Avg_Sale_Amount, town_weights, zero.policy = TRUE)
+
+# Print Moran's I results
+cat("Moran's I Statistic:", moran_result$estimate["Moran I"], "\n")
+cat("P-value:", moran_result$p.value, "\n")
+
+# Visualize the spatial distribution of sale amounts
+town_sf <- st_as_sf(town_data)  # Convert to sf object
+
+# Plot spatial sale amount patterns
+ggplot(data = town_sf) +
+  geom_sf(aes(color = Avg_Sale_Amount, size = Avg_Sale_Amount)) +
+  scale_color_viridis_c(option = "C") +
+  labs(
+    title = "Spatial Distribution of Average Sale Amount by Town",
+    color = "Avg Sale Amount (k)",
+    size = "Avg Sale Amount (k)"
+  ) +
+  theme_minimal()
+
+# Create Moran scatter plot
+moran_plot <- moran.plot(town_data$Avg_Sale_Amount, town_weights, 
+                         main = "Moran's I Scatterplot for Sale Amounts")
+
+```
+# Nearby towns tend to have similar sale amounts. According to the chart of Spatial Distribution of Average Sale Amount by Town, above 2 millions pounds are in the same nearby areas of the far North West. Most of the same area of below 500000 pounds are in the same areas which occupied most of the data recorded.
